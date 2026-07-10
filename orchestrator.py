@@ -62,6 +62,8 @@ RISK = {
     "required_votes": 2,               # 2-of-3 HEADS, regardless of weights
     "kelly_fraction": 0.5,
     "position_stop_pct": 0.50,
+    "trailing_arm_pct": 0.30,          # peak gain that arms the trailing take-profit
+    "trailing_giveback_pct": 0.10,     # giveback from peak gain that triggers the exit
     "exit_votes_required": 2,
 }
 
@@ -499,6 +501,7 @@ def execute_entry(d: TradeDecision, mkt: MarketSnapshot, state: dict) -> None:
     state["positions"][d.market_id] = {
         "question": d.question, "side": d.side, "token_id": d.token_id,
         "entry_price": d.limit_price, "size_usd": d.size_usd, "shares": d.shares,
+        "peak_price": d.limit_price,
         "consensus_at_entry": d.consensus_prob, "end_date": mkt.end_date,
         "paper": not LIVE_TRADING, "opened_at": datetime.now(timezone.utc).isoformat()}
     day = state["daily"].setdefault(today_key(), {"realized_pnl": 0.0, "trades": 0})
@@ -560,8 +563,15 @@ def manage_positions(state: dict) -> None:
             log.warning(f"No book for {pos['question'][:50]} — holding.")
             continue
         mark = book["bid"]
+        pos["peak_price"] = max(pos.get("peak_price", pos["entry_price"]), mark)
         if mark <= pos["entry_price"] * (1 - RISK["position_stop_pct"]):
             execute_exit(market_id, pos, mark, "hard_stop", state)
+            continue
+        gain_now = mark / pos["entry_price"] - 1
+        peak_gain = pos["peak_price"] / pos["entry_price"] - 1
+        if (peak_gain >= RISK["trailing_arm_pct"]
+                and gain_now <= peak_gain - RISK["trailing_giveback_pct"]):
+            execute_exit(market_id, pos, mark, "trailing_take_profit", state)
             continue
         reviewable.append((market_id, pos, mark))
 
