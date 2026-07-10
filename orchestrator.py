@@ -168,15 +168,30 @@ def open_slots(state: dict) -> int:
 # ---------------------------------------------------------------------------
 
 def fetch_candidate_markets(exclude_ids: set) -> list:
-    params = {"active": "true", "closed": "false", "limit": 150,
-              "order": "volume24hr", "ascending": "false"}
-    r = requests.get(f"{GAMMA_API}/markets", params=params, timeout=15)
-    r.raise_for_status()
-    snapshots = []
-    for m in r.json():
+    # Gamma's /markets listing returns tags=null; tags are only filterable on
+    # /events via tag_slug. Pull tagged events, then flatten their markets.
+    raw_markets, seen = [], set()
+    for tag in MARKET_TAGS:
         try:
-            tags = [t.lower() for t in (m.get("tags") or [])]
-            if not any(t in tags for t in MARKET_TAGS):
+            r = requests.get(f"{GAMMA_API}/events",
+                             params={"active": "true", "closed": "false", "limit": 50,
+                                     "order": "volume24hr", "ascending": "false",
+                                     "tag_slug": tag}, timeout=15)
+            r.raise_for_status()
+            for ev in r.json():
+                for m in ev.get("markets") or []:
+                    key = m.get("conditionId", m.get("id", ""))
+                    if key and key not in seen:
+                        seen.add(key)
+                        raw_markets.append(m)
+        except Exception as e:
+            log.warning(f"event fetch failed for tag '{tag}': {e}")
+    raw_markets.sort(key=lambda m: float(m.get("volume24hr") or 0), reverse=True)
+
+    snapshots = []
+    for m in raw_markets:
+        try:
+            if m.get("closed") or not m.get("active", True):
                 continue
             mid = m.get("conditionId", m.get("id", ""))
             if mid in exclude_ids:
@@ -267,6 +282,16 @@ def call_model(provider: str, model: str, prompt: str, max_tokens: int) -> str:
 def strip_fences(raw: str) -> str:
     return raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
 
+def parse_json_lenient(raw: str):
+    """json.loads with a fallback that strips trailing commas (some models emit
+    `"reasoning": "...", }` which strict JSON rejects)."""
+    cleaned = strip_fences(raw)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        import re
+        return json.loads(re.sub(r",\s*([}\]])", r"\1", cleaned))
+
 _persona_cache: dict = {}
 
 def load_persona(agent: dict) -> str:
@@ -307,7 +332,7 @@ def triage(markets: list) -> list:
     try:
         raw = call_model(TRIAGE_MODEL["provider"], TRIAGE_MODEL["model"],
                          TRIAGE_PROMPT.format(markets_block=block), max_tokens=200)
-        keep = [i for i in json.loads(strip_fences(raw)) if isinstance(i, int) and 0 <= i < len(markets)]
+        keep = [i for i in parse_json_lenient(raw) if isinstance(i, int) and 0 <= i < len(markets)]
         log.info(f"Triage kept {len(keep)}/{len(markets)}: {keep}")
         return [markets[i] for i in keep]
     except Exception as e:
@@ -367,9 +392,11 @@ def consult_batch(prompt_template: str, markets_block: str, n_items: int) -> dic
             persona = load_persona(agent)
             if persona:
                 prompt = persona + "\n\n---\n\n" + prompt
+            # Budget must cover thinking tokens too (Sonnet 5 on Vertex thinks
+            # by default and thinking counts against max_tokens).
             raw = call_model(agent["provider"], agent["model"], prompt,
-                             max_tokens=200 * n_items + 200)
-            for item in json.loads(strip_fences(raw)):
+                             max_tokens=500 * n_items + 2000)
+            for item in parse_json_lenient(raw):
                 try:
                     idx = int(item["market_index"])
                     if not 0 <= idx < n_items:
