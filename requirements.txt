@@ -1,0 +1,4 @@
+anthropic[vertex]
+openai
+py-clob-client
+requests
