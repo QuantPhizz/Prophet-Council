@@ -621,6 +621,11 @@ def hunt(state: dict) -> None:
         f"| YES bid {m.best_bid:.2f} / ask {m.best_ask:.2f} | 24h vol ${m.volume_24h:,.0f}"
         for i, m in enumerate(markets))
     desk = consult_batch(ENTRY_BATCH_PROMPT, block, len(markets))
+    journal(state, "hunt", {
+        "candidates": [m.question for m in markets],
+        "desk": {k: [asdict(o) for o in v] for k, v in desk.items()},
+    })
+    save_state(state)
 
     for i, mkt in enumerate(markets):
         if open_slots(state) <= 0:
@@ -647,6 +652,7 @@ def run_once() -> None:
     if hunting:
         hunt(state)             # 3x/day: triage + batched entry analysis
 
+    save_state(state)
     log.info(f"Run complete | cash=${state['cash']:.2f} | positions={len(state['positions'])}")
 
 if __name__ == "__main__":
