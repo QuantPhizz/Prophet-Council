@@ -545,13 +545,10 @@ def settle_resolved(market_id: str, pos: dict, outcome_prices, state: dict) -> N
 # POSITION MONITORING / EXIT ENGINE (runs every cycle, batched desk review)
 # ---------------------------------------------------------------------------
 
-def manage_positions(state: dict) -> None:
-    if not state["positions"]:
-        return
-    log.info(f"--- Managing {len(state['positions'])} open position(s) ---")
-
-    # Pass 1: settlements + hard stops (no model calls needed)
-    reviewable = []   # (market_id, pos, mark_bid)
+def watchdog_pass(state: dict) -> list:
+    """Pass 1: settlements, peak-price update, hard stop, trailing take-profit.
+    No model calls. Returns positions still held as [(market_id, pos, mark_bid)]."""
+    reviewable = []
     for market_id in list(state["positions"].keys()):
         pos = state["positions"][market_id]
         status = fetch_market_status(market_id)
@@ -574,7 +571,14 @@ def manage_positions(state: dict) -> None:
             execute_exit(market_id, pos, mark, "trailing_take_profit", state)
             continue
         reviewable.append((market_id, pos, mark))
+    return reviewable
 
+def manage_positions(state: dict) -> None:
+    if not state["positions"]:
+        return
+    log.info(f"--- Managing {len(state['positions'])} open position(s) ---")
+
+    reviewable = watchdog_pass(state)
     if not reviewable:
         return
 
@@ -665,5 +669,20 @@ def run_once() -> None:
     save_state(state)
     log.info(f"Run complete | cash=${state['cash']:.2f} | positions={len(state['positions'])}")
 
+def run_watchdog_only() -> None:
+    """Mechanical safety pass between full desk runs: settlements, hard stops,
+    trailing take-profits. No agent calls, no hunting."""
+    state = load_state()
+    n_before = len(state["positions"])
+    held = watchdog_pass(state) if state["positions"] else []
+    save_state(state)
+    log.info(f"Watchdog | positions {n_before} -> {len(state['positions'])} "
+             f"({len(held)} held) | cash=${state['cash']:.2f} "
+             f"| daily P&L=${daily_pnl(state):.2f}")
+
 if __name__ == "__main__":
-    run_once()
+    import sys
+    if "--watchdog-only" in sys.argv[1:]:
+        run_watchdog_only()
+    else:
+        run_once()
