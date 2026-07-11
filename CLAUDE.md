@@ -10,8 +10,14 @@
 
 Prophet Council is a Polymarket multi-agent trading desk (originally handed off
 as "polydesk"). A single Python orchestrator (`orchestrator.py`) runs a
-three-agent analyst desk plus a triage pre-filter over Polymarket markets
-(crypto, sports, weather only), paper-trading by default.
+three-agent analyst desk plus a triage pre-filter over Polymarket **US**
+markets (crypto, sports, climate only), paper-trading by default.
+
+Migrated from Polymarket International to Polymarket US on 2026-07-11 (see
+`SPEC_polymarket_us_migration.md`) — these are separate platforms with
+unrelated order books/prices. Data reads and order execution both go through
+the `polymarket-us` SDK now; there is no wallet, private key, or on-chain gas
+token anywhere in this project.
 
 The desk (runtime personas, NOT Claude Code subagents — never create
 .claude/agents entries for them):
@@ -35,9 +41,12 @@ Persona files live in `personas/` and must sit alongside `orchestrator.py`
 ## SECRETS & SAFETY
 
 - LIVE_TRADING stays "false" until the operator explicitly says otherwise.
-- POLY_PRIVATE_KEY is handled by the operator manually — never by an agent.
+- POLYMARKET_KEY_ID / POLYMARKET_SECRET_KEY are the Polymarket US API
+  credentials (Ed25519 signing handled internally by the SDK). No wallet, no
+  private key, no chain id.
 - Env vars: GOOGLE_CLOUD_PROJECT, GOOGLE_APPLICATION_CREDENTIALS (or ADC),
-  XAI_API_KEY, LIVE_TRADING, FORCE_HUNT. Local `.env` only, never committed.
+  XAI_API_KEY, POLYMARKET_KEY_ID, POLYMARKET_SECRET_KEY, LIVE_TRADING,
+  FORCE_HUNT. Local `.env` only, never committed.
 - `.env`, `orchestrator_state.json`, and `*.log` are gitignored.
 
 ## RUNNING
