@@ -2,6 +2,14 @@
 
 Audience: Claude Code terminal agent. Read fully before acting.
 
+> **MIGRATION NOTE (2026-07-11):** This handoff describes the original build
+> against Polymarket International (polymarket.com). The desk has since been
+> migrated to Polymarket US (polymarket.us) — see
+> `SPEC_polymarket_us_migration.md` and the `CLAUDE.md` in this directory for
+> current facts. `POLY_PRIVATE_KEY`/`py-clob-client` below are historical and
+> no longer apply; current execution uses `POLYMARKET_KEY_ID` /
+> `POLYMARKET_SECRET_KEY` via the `polymarket-us` SDK.
+
 ## ⚠️ Environment guardrails — read first
 - The operator has an EXISTING set of "storm team" aliases (shell aliases and/or
   Claude Code subagent definitions). DO NOT modify, rename, overwrite, or remove any

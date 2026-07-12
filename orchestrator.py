@@ -1,5 +1,5 @@
 """
-Multi-Agent Prediction Market Orchestrator — v3
+Multi-Agent Prediction Market Orchestrator — v4
 ===============================================
 Desk:
   - Kisuke  -> Claude Fable 5    (Vertex AI, global) — weight 1.3 (senior analyst)
@@ -19,21 +19,32 @@ v3 changes (cost + weighting):
     probability, edge, sizing, and exit fair-value math. The 2-of-3 vote
     requirement is UNCHANGED — weight moves the numbers, never the vote count.
 
-Universe: crypto, sports, weather only.
+Universe: crypto, sports, climate only.
+
+v4 change — Polymarket US migration (data + execution):
+  Both the data-read layer and the order-execution layer now point at
+  Polymarket US (polymarket.us, CFTC-regulated), not Polymarket International
+  (polymarket.com). These are two entirely separate platforms with unrelated
+  order books and prices, even for identically-worded markets. See
+  SPEC_polymarket_us_migration.md (operator-provided) for the full rationale.
+  Market universe changed too: US has no "weather" category (climate is the
+  equivalent) and a much thinner crypto listing (~13 BTC-threshold markets vs.
+  International's broader crypto board).
 
 Cron (6x daily, UTC):
   0 0,4,8,12,16,20 * * *  cd /path/to/bot && /usr/bin/python3 orchestrator.py >> orchestrator.log 2>&1
 Hunts fire automatically on the 0/8/16 UTC runs; the 4/12/20 runs are review-only.
+Plus a separate watchdog cron every 20 min: orchestrator.py --watchdog-only
 
 Env vars:
   GOOGLE_CLOUD_PROJECT, GOOGLE_APPLICATION_CREDENTIALS  (Vertex, global endpoint)
   XAI_API_KEY
+  POLYMARKET_KEY_ID, POLYMARKET_SECRET_KEY  (Polymarket US; no wallet/private key)
   LIVE_TRADING ("true" for real money; default paper)
-  POLY_PRIVATE_KEY (live only)
   FORCE_HUNT ("true" to force a hunt on any run, e.g. manual invocations)
 
 Install:
-  pip install "anthropic[vertex]" openai py-clob-client requests
+  pip install "anthropic[vertex]" openai polymarket-us
 
 NOT FINANCIAL ADVICE.
 """
@@ -44,8 +55,6 @@ import time
 import logging
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
-
-import requests
 
 # ---------------------------------------------------------------------------
 # CONFIG
@@ -70,7 +79,7 @@ RISK = {
 LIVE_TRADING = os.getenv("LIVE_TRADING", "false").lower() == "true"
 FORCE_HUNT = os.getenv("FORCE_HUNT", "false").lower() == "true"
 
-MARKET_TAGS = ["crypto", "sports", "weather"]
+MARKET_TAGS = ["crypto", "sports", "climate"]   # Polymarket US categories; no "weather" — climate is the equivalent
 MAX_MARKETS_PER_RUN = 8        # candidates entering triage
 MAX_MARKETS_PER_CALL = 8       # anchoring guard for batched prompts
 HUNT_HOURS_UTC = {0, 8, 16}    # 3 hunts/day; all 6 runs do position reviews
@@ -87,8 +96,6 @@ AGENTS = [
 ]
 TRIAGE_MODEL = {"provider": "vertex", "model": "claude-haiku-4-5"}
 
-GAMMA_API = "https://gamma-api.polymarket.com"
-CLOB_API = "https://clob.polymarket.com"
 STATE_FILE = "orchestrator_state.json"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -100,15 +107,18 @@ log = logging.getLogger("orchestrator")
 
 @dataclass
 class MarketSnapshot:
-    market_id: str
+    market_id: str          # Polymarket US slug (not a conditionId — see fetch_candidate_markets)
     question: str
     description: str
     end_date: str
+    # Polymarket US has no separate CLOB token ids; orders reference a market by
+    # slug + intent instead of a token. Both fields carry the slug so decide_entry
+    # / TradeDecision don't need a shape change downstream.
     yes_token_id: str
     no_token_id: str
     best_bid: float
     best_ask: float
-    liquidity_usd: float
+    liquidity_usd: float    # proxy = volume24hr; Polymarket US exposes no liquidity figure — see fetch_candidate_markets
     volume_24h: float
 
 @dataclass
@@ -166,56 +176,95 @@ def open_slots(state: dict) -> int:
     return RISK["max_concurrent_positions"] - len(state["positions"])
 
 # ---------------------------------------------------------------------------
-# POLYMARKET MARKET DATA
+# POLYMARKET US — MARKET DATA
 # ---------------------------------------------------------------------------
+# All facts below were verified interactively against the live API (not just
+# the SDK's own doc examples, which are inconsistent with it in places):
+#   - markets.list(...) returns a dict {"markets": [...]}, no pagination
+#     metadata — page until a batch comes back shorter than the requested limit.
+#   - Working params: limit (server caps at 500/call), closed (bool), offset
+#     (confirmed to actually paginate). Non-functional/silently-ignored params:
+#     active, category (as a filter arg), sort, order, page — filter client-side.
+#   - retrieveBySlug (camelCase, per SDK quickstart docs) does not exist on the
+#     client; the real method is snake_case: markets.retrieve_by_slug(slug).
+#   - No liquidityNum/liquidity/clobTokenIds shape exists on these market
+#     objects at all (confirmed empty across the full ~5,500-market open
+#     universe) — see the liquidity_proxy note below.
+#   - `outcomes` (the plain-language label array, e.g. ["Titans","Chargers"])
+#     does NOT line up positionally with `marketSides`' own long/short flag —
+#     a resolved 2-team market had outcomes=["Titans","Chargers"] but the
+#     long/winning marketSide was "Chargers", listed *second*. Reading
+#     outcomes[0]/outcomePrices[0] as "the YES side" the way Gamma's fixed
+#     ["Yes","No"] convention allowed is therefore unsafe here. (outcomePrices
+#     itself happened to read [1.0, 0.0] = [long, short] in that same example —
+#     i.e. it may already be long-first regardless of `outcomes`' order — but
+#     that's one data point, not a documented guarantee, so fetch_market_status
+#     below derives outcome_prices directly from marketSides' `long` flag
+#     instead of trusting positional array order at all.)
+
+_pmus_client = None
+
+def pmus_client():
+    global _pmus_client
+    if _pmus_client is None:
+        from polymarket_us import PolymarketUS
+        _pmus_client = PolymarketUS(
+            key_id=os.environ["POLYMARKET_KEY_ID"],
+            secret_key=os.environ["POLYMARKET_SECRET_KEY"],
+        )
+    return _pmus_client
 
 def fetch_candidate_markets(exclude_ids: set) -> list:
-    # Gamma's /markets listing returns tags=null; tags are only filterable on
-    # /events via tag_slug. Pull tagged events, then flatten their markets.
-    raw_markets, seen = [], set()
-    for tag in MARKET_TAGS:
+    raw_markets, offset, page_size = [], 0, 500
+    while True:
         try:
-            r = requests.get(f"{GAMMA_API}/events",
-                             params={"active": "true", "closed": "false", "limit": 50,
-                                     "order": "volume24hr", "ascending": "false",
-                                     "tag_slug": tag}, timeout=15)
-            r.raise_for_status()
-            for ev in r.json():
-                for m in ev.get("markets") or []:
-                    key = m.get("conditionId", m.get("id", ""))
-                    if key and key not in seen:
-                        seen.add(key)
-                        raw_markets.append(m)
+            resp = pmus_client().markets.list({"limit": page_size, "closed": False, "offset": offset})
         except Exception as e:
-            log.warning(f"event fetch failed for tag '{tag}': {e}")
-    raw_markets.sort(key=lambda m: float(m.get("volume24hr") or 0), reverse=True)
+            log.warning(f"markets.list failed at offset {offset}: {e}")
+            break
+        batch = resp.get("markets") or []
+        raw_markets.extend(batch)
+        if len(batch) < page_size:
+            break
+        offset += page_size
+        if offset > 10000:      # safety cap; the full open-market universe is ~5.5k
+            log.warning("markets.list pagination hit safety cap at offset 10000.")
+            break
+
+    candidates = [m for m in raw_markets if m.get("category") in MARKET_TAGS]
+    candidates.sort(key=lambda m: float(m.get("volume24hr") or 0), reverse=True)
 
     snapshots = []
-    for m in raw_markets:
+    for m in candidates:
         try:
             if m.get("closed") or not m.get("active", True):
                 continue
-            mid = m.get("conditionId", m.get("id", ""))
-            if mid in exclude_ids:
+            mid = m.get("slug", "")
+            if not mid or mid in exclude_ids:
                 continue
-            liquidity = float(m.get("liquidityNum") or m.get("liquidity") or 0)
-            if liquidity < RISK["min_liquidity_usd"]:
+
+            # FLAGGED TO OPERATOR (not a RISK change): Polymarket US market
+            # objects expose no liquidity figure of any kind. volume24hr is the
+            # closest available substitute; min_liquidity_usd is unchanged but
+            # now effectively gates on 24h volume, not book depth. If a truer
+            # depth-based figure is wanted, markets.book(slug) returns real
+            # bids/offers with quantities that could be summed into a notional
+            # figure at the cost of one extra call per surviving candidate.
+            liquidity_proxy = float(m.get("volume24hr") or 0)
+            if liquidity_proxy < RISK["min_liquidity_usd"]:
                 continue
-            token_ids = m.get("clobTokenIds")
-            if isinstance(token_ids, str):
-                token_ids = json.loads(token_ids)
-            if not token_ids or len(token_ids) != 2:
-                continue
-            book = fetch_top_of_book(token_ids[0])
+
+            book = fetch_top_of_book(mid)
             if book is None:
                 continue
+
             snapshots.append(MarketSnapshot(
                 market_id=mid, question=m.get("question", ""),
                 description=(m.get("description") or "")[:1200],
                 end_date=m.get("endDate", ""),
-                yes_token_id=token_ids[0], no_token_id=token_ids[1],
+                yes_token_id=mid, no_token_id=mid,
                 best_bid=book["bid"], best_ask=book["ask"],
-                liquidity_usd=liquidity, volume_24h=float(m.get("volume24hr") or 0),
+                liquidity_usd=liquidity_proxy, volume_24h=liquidity_proxy,
             ))
         except Exception as e:
             log.debug(f"skip market: {e}")
@@ -224,30 +273,31 @@ def fetch_candidate_markets(exclude_ids: set) -> list:
     log.info(f"{len(snapshots)} candidates [{', '.join(MARKET_TAGS)}]")
     return snapshots
 
-def fetch_top_of_book(token_id: str):
+def fetch_top_of_book(slug: str):
     try:
-        r = requests.get(f"{CLOB_API}/book", params={"token_id": token_id}, timeout=10)
-        r.raise_for_status()
-        book = r.json()
-        bids, asks = book.get("bids") or [], book.get("asks") or []
-        if not bids or not asks:
+        data = pmus_client().markets.bbo(slug)["marketData"]
+        bid, ask = data.get("bestBid"), data.get("bestAsk")
+        if not bid or not ask:
             return None
-        return {"bid": float(bids[-1]["price"]), "ask": float(asks[-1]["price"])}
+        return {"bid": float(bid["value"]), "ask": float(ask["value"])}
     except Exception:
         return None
 
 def fetch_market_status(market_id: str):
     try:
-        r = requests.get(f"{GAMMA_API}/markets", params={"condition_ids": market_id}, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        if not data:
+        m = pmus_client().markets.retrieve_by_slug(market_id)["market"]
+        sides = {s.get("long"): s for s in (m.get("marketSides") or [])}
+        if True not in sides or False not in sides:
             return None
-        m = data[0]
-        prices = m.get("outcomePrices")
-        if isinstance(prices, str):
-            prices = json.loads(prices)
-        return {"closed": bool(m.get("closed")), "outcome_prices": prices}
+        # Build outcome_prices ourselves as [long_price, short_price] using the
+        # `long` flag directly, rather than trusting outcomes/outcomePrices
+        # array order (see module-level note above). This keeps settle_resolved()
+        # correct without needing any change there: index 0 is guaranteed to be
+        # the long/"YES" payout, verified end-to-end against a real resolved
+        # market (Chargers/long won at $1, correctly returned as index 0 here
+        # even though "Chargers" is outcomes[1], not outcomes[0]).
+        outcome_prices = [float(sides[True]["price"]), float(sides[False]["price"])]
+        return {"closed": bool(m.get("closed")), "outcome_prices": outcome_prices}
     except Exception:
         return None
 
@@ -476,53 +526,114 @@ def decide_entry(mkt: MarketSnapshot, opinions: list, state: dict):
     return None
 
 # ---------------------------------------------------------------------------
-# EXECUTION
+# EXECUTION (Polymarket US — no wallet, no private key, no on-chain gas token)
 # ---------------------------------------------------------------------------
+# Verified against the SDK's own type stubs (typing.get_type_hints), which are
+# generated from the real API contract and more reliable here than the SDK's
+# prose docs:
+#   - CreateOrderParams field is `marketSlug` (confirmed, not bare `slug`).
+#   - intent is one of ORDER_INTENT_{BUY,SELL}_{LONG,SHORT}. marketSides carry
+#     an explicit `long` bool, and our desk's "YES" = the long side, "NO" = the
+#     short side (bestBidQuote/bestAskQuote on the market object are quoted for
+#     the long side, matching decide_entry's existing YES pricing).
+#   - orders.close_position({"marketSlug": slug}) exits whatever side the
+#     account actually holds — no need to track/guess a SELL_LONG vs SELL_SHORT
+#     intent for an exit, which removes a whole class of bug. Used for every
+#     exit path (hard stop, trailing take-profit, consensus flip, edge exhausted).
+#   - quantity is typed int; minimumTradeQty was 1 on every market checked, so
+#     whole-share sizing is required (no fractional shares like International).
+#   - Order/close responses are plain dicts with an "executions" list; each
+#     execution has a `type` (…_FILL / …_PARTIAL_FILL / …_NEW / etc.) and a
+#     `lastPx` fill price that can differ from the requested limit price.
+#   - No `redeem` method exists anywhere in the SDK. portfolio/account
+#     endpoints expose an ACTIVITY_TYPE_POSITION_RESOLUTION activity type,
+#     confirming settlement of resolved positions is automatic (cash-settled,
+#     not on-chain CTF tokens) — settle_resolved() below needs no extra API call.
 
-def clob_client():
-    from py_clob_client.client import ClobClient
-    client = ClobClient(CLOB_API, key=os.environ["POLY_PRIVATE_KEY"], chain_id=137)
-    client.set_api_creds(client.create_or_derive_api_creds())
-    return client
+INTENT_FOR_SIDE = {"YES": "ORDER_INTENT_BUY_LONG", "NO": "ORDER_INTENT_BUY_SHORT"}
 
-def place_order(token_id: str, price: float, shares: float, side: str):
-    from py_clob_client.clob_types import OrderArgs, OrderType
-    from py_clob_client.order_builder.constants import BUY, SELL
-    client = clob_client()
-    order = OrderArgs(price=price, size=shares,
-                      side=BUY if side == "BUY" else SELL, token_id=token_id)
-    return client.post_order(client.create_order(order), OrderType.GTC)
+def place_entry_order(slug: str, side: str, price: float, shares: float) -> dict:
+    return pmus_client().orders.create({
+        "marketSlug": slug,
+        "intent": INTENT_FOR_SIDE[side],
+        "type": "ORDER_TYPE_LIMIT",
+        "price": {"value": f"{price:.3f}", "currency": "USD"},
+        "quantity": max(1, int(shares)),
+        "tif": "TIME_IN_FORCE_GOOD_TILL_CANCEL",
+    })
+
+def close_position_order(slug: str) -> dict:
+    return pmus_client().orders.close_position({"marketSlug": slug})
+
+def extract_fill(resp: dict):
+    """(fill_price, fill_shares) from the last FILL/PARTIAL_FILL execution in an
+    order/close-position response, or (None, None) if nothing has filled yet
+    (e.g. a GTC limit order still resting on the book)."""
+    for ex in reversed((resp or {}).get("executions") or []):
+        if ex.get("type") in ("EXECUTION_TYPE_FILL", "EXECUTION_TYPE_PARTIAL_FILL") and ex.get("lastPx"):
+            try:
+                return float(ex["lastPx"]["value"]), float(ex.get("lastShares") or 0)
+            except Exception:
+                continue
+    return None, None
 
 def execute_entry(d: TradeDecision, mkt: MarketSnapshot, state: dict) -> None:
     mode = "LIVE" if LIVE_TRADING else "PAPER"
-    resp = place_order(d.token_id, d.limit_price, d.shares, "BUY") if LIVE_TRADING else None
-    log.info(f"[{mode}] BUY {d.side} {d.shares} sh @ {d.limit_price:.2f} (${d.size_usd:.2f}) :: {d.question[:60]}")
-    state["cash"] = round(state["cash"] - d.size_usd, 2)
+    resp, fill_price, shares, cost = None, d.limit_price, d.shares, d.size_usd
+    if LIVE_TRADING:
+        resp = place_entry_order(d.token_id, d.side, d.limit_price, d.shares)
+        fp, fq = extract_fill(resp)
+        if fp is not None:
+            fill_price = fp
+        # Use the ACTUAL filled quantity, not a value back-derived from the
+        # requested size_usd: the order sent quantity=int(d.shares) (already
+        # truncated), and a fill price that differs from the limit price would
+        # otherwise silently desync recorded shares/cash from what was really
+        # bought. Falls back to the submitted (int-truncated) quantity only if
+        # nothing has filled yet (e.g. a GTC order still resting on the book).
+        shares = fq if fq else float(max(1, int(d.shares)))
+        cost = round(shares * fill_price, 2)
+    log.info(f"[{mode}] BUY {d.side} {shares} sh @ {fill_price:.2f} (${cost:.2f}) :: {d.question[:60]}")
+    state["cash"] = round(state["cash"] - cost, 2)
     state["positions"][d.market_id] = {
         "question": d.question, "side": d.side, "token_id": d.token_id,
-        "entry_price": d.limit_price, "size_usd": d.size_usd, "shares": d.shares,
-        "peak_price": d.limit_price,
+        "entry_price": fill_price, "size_usd": cost, "shares": shares,
+        "peak_price": fill_price,
         "consensus_at_entry": d.consensus_prob, "end_date": mkt.end_date,
         "paper": not LIVE_TRADING, "opened_at": datetime.now(timezone.utc).isoformat()}
     day = state["daily"].setdefault(today_key(), {"realized_pnl": 0.0, "trades": 0})
     day["trades"] += 1
     journal(state, "entry", {"decision": asdict(d), "live": LIVE_TRADING,
-                             "order_response": str(resp) if resp else None})
+                             "requested_price": d.limit_price, "fill_price": fill_price,
+                             "requested_size_usd": d.size_usd, "actual_cost_usd": cost,
+                             "order_response": resp})
     save_state(state)
 
 def execute_exit(market_id: str, pos: dict, exit_price: float, reason: str, state: dict) -> None:
     mode = "LIVE" if LIVE_TRADING else "PAPER"
-    resp = None
+    resp, fill_price, closed_shares = None, exit_price, pos["shares"]
     if LIVE_TRADING and not pos.get("paper"):
-        resp = place_order(pos["token_id"], round(exit_price, 2), pos["shares"], "SELL")
-    proceeds = round(pos["shares"] * exit_price, 2)
+        resp = close_position_order(market_id)
+        fp, fq = extract_fill(resp)
+        if fp is not None:
+            fill_price = fp
+        if fq:
+            closed_shares = fq
+            if round(closed_shares, 2) < round(pos["shares"], 2):
+                # We still record the position as fully closed below (this code
+                # has no partial-position model) — flagging loudly rather than
+                # silently mis-accounting the unfilled remainder.
+                log.warning(f"close_position only partially filled ({closed_shares}/{pos['shares']} sh) "
+                            f"for {pos['question'][:50]!r} — treating as fully closed; "
+                            f"P&L will be understated for the unfilled remainder.")
+    proceeds = round(closed_shares * fill_price, 2)
     pnl = round(proceeds - pos["size_usd"], 2)
     state["cash"] = round(state["cash"] + proceeds, 2)
     book_pnl(state, pnl)
-    log.info(f"[{mode}] EXIT ({reason}) {pos['side']} @ {exit_price:.2f} | P&L ${pnl:+.2f} :: {pos['question'][:60]}")
+    log.info(f"[{mode}] EXIT ({reason}) {pos['side']} @ {fill_price:.2f} | P&L ${pnl:+.2f} :: {pos['question'][:60]}")
     journal(state, "exit", {"market_id": market_id, "reason": reason,
-                            "exit_price": exit_price, "pnl": pnl,
-                            "order_response": str(resp) if resp else None})
+                            "requested_exit_price": exit_price, "fill_price": fill_price,
+                            "closed_shares": closed_shares, "pnl": pnl, "order_response": resp})
     del state["positions"][market_id]
     save_state(state)
 
