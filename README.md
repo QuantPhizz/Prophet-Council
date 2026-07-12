@@ -73,9 +73,12 @@ State (bankroll, positions, journal) persists in `orchestrator_state.json`
   `volume24hr` as a substitute; `RISK.min_liquidity_usd` now effectively gates
   on 24h volume, not book depth. Flagged, not silently redefined — see
   comments in `fetch_candidate_markets`.
-- **Credential auth currently fails on authenticated endpoints** (`account.balances`,
-  `portfolio.positions`, `orders.*`) with a base64 padding error — the stored
-  `POLYMARKET_SECRET_KEY` looks truncated (86 chars, not a multiple of 4).
-  Public endpoints (`markets.list`/`bbo`/`book`/`retrieve_by_slug`) are
-  unaffected and work today. This only blocks `LIVE_TRADING=true`, which is
-  out of scope regardless — paper mode is fully functional.
+
+**Resolved (2026-07-12):** `POLYMARKET_SECRET_KEY` was truncated (86 chars,
+not a multiple of 4 — invalid base64 padding), causing every authenticated
+endpoint to fail. Operator replaced it with the full value; re-verified
+end-to-end: `account.balances` / `portfolio.positions` now return `200 OK`
+(account is unfunded — empty balances/positions, as expected), and
+`orders.preview` round-trips against a real live market. Auth is confirmed
+working. Account still has $0 funded, and `LIVE_TRADING` stays `false` until
+the operator funds it and says otherwise.
