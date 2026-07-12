@@ -579,18 +579,25 @@ def extract_fill(resp: dict):
 
 def execute_entry(d: TradeDecision, mkt: MarketSnapshot, state: dict) -> None:
     mode = "LIVE" if LIVE_TRADING else "PAPER"
-    resp, fill_price = None, d.limit_price
+    resp, fill_price, shares, cost = None, d.limit_price, d.shares, d.size_usd
     if LIVE_TRADING:
         resp = place_entry_order(d.token_id, d.side, d.limit_price, d.shares)
-        fp, _ = extract_fill(resp)
+        fp, fq = extract_fill(resp)
         if fp is not None:
             fill_price = fp
-    shares = round(d.size_usd / fill_price, 2) if fill_price else d.shares
-    log.info(f"[{mode}] BUY {d.side} {shares} sh @ {fill_price:.2f} (${d.size_usd:.2f}) :: {d.question[:60]}")
-    state["cash"] = round(state["cash"] - d.size_usd, 2)
+        # Use the ACTUAL filled quantity, not a value back-derived from the
+        # requested size_usd: the order sent quantity=int(d.shares) (already
+        # truncated), and a fill price that differs from the limit price would
+        # otherwise silently desync recorded shares/cash from what was really
+        # bought. Falls back to the submitted (int-truncated) quantity only if
+        # nothing has filled yet (e.g. a GTC order still resting on the book).
+        shares = fq if fq else float(max(1, int(d.shares)))
+        cost = round(shares * fill_price, 2)
+    log.info(f"[{mode}] BUY {d.side} {shares} sh @ {fill_price:.2f} (${cost:.2f}) :: {d.question[:60]}")
+    state["cash"] = round(state["cash"] - cost, 2)
     state["positions"][d.market_id] = {
         "question": d.question, "side": d.side, "token_id": d.token_id,
-        "entry_price": fill_price, "size_usd": d.size_usd, "shares": shares,
+        "entry_price": fill_price, "size_usd": cost, "shares": shares,
         "peak_price": fill_price,
         "consensus_at_entry": d.consensus_prob, "end_date": mkt.end_date,
         "paper": not LIVE_TRADING, "opened_at": datetime.now(timezone.utc).isoformat()}
@@ -598,25 +605,35 @@ def execute_entry(d: TradeDecision, mkt: MarketSnapshot, state: dict) -> None:
     day["trades"] += 1
     journal(state, "entry", {"decision": asdict(d), "live": LIVE_TRADING,
                              "requested_price": d.limit_price, "fill_price": fill_price,
+                             "requested_size_usd": d.size_usd, "actual_cost_usd": cost,
                              "order_response": resp})
     save_state(state)
 
 def execute_exit(market_id: str, pos: dict, exit_price: float, reason: str, state: dict) -> None:
     mode = "LIVE" if LIVE_TRADING else "PAPER"
-    resp, fill_price = None, exit_price
+    resp, fill_price, closed_shares = None, exit_price, pos["shares"]
     if LIVE_TRADING and not pos.get("paper"):
         resp = close_position_order(market_id)
-        fp, _ = extract_fill(resp)
+        fp, fq = extract_fill(resp)
         if fp is not None:
             fill_price = fp
-    proceeds = round(pos["shares"] * fill_price, 2)
+        if fq:
+            closed_shares = fq
+            if round(closed_shares, 2) < round(pos["shares"], 2):
+                # We still record the position as fully closed below (this code
+                # has no partial-position model) — flagging loudly rather than
+                # silently mis-accounting the unfilled remainder.
+                log.warning(f"close_position only partially filled ({closed_shares}/{pos['shares']} sh) "
+                            f"for {pos['question'][:50]!r} — treating as fully closed; "
+                            f"P&L will be understated for the unfilled remainder.")
+    proceeds = round(closed_shares * fill_price, 2)
     pnl = round(proceeds - pos["size_usd"], 2)
     state["cash"] = round(state["cash"] + proceeds, 2)
     book_pnl(state, pnl)
     log.info(f"[{mode}] EXIT ({reason}) {pos['side']} @ {fill_price:.2f} | P&L ${pnl:+.2f} :: {pos['question'][:60]}")
     journal(state, "exit", {"market_id": market_id, "reason": reason,
                             "requested_exit_price": exit_price, "fill_price": fill_price,
-                            "pnl": pnl, "order_response": resp})
+                            "closed_shares": closed_shares, "pnl": pnl, "order_response": resp})
     del state["positions"][market_id]
     save_state(state)
 
