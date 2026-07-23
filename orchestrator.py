@@ -215,7 +215,11 @@ def pmus_client():
     return _pmus_client
 
 def fetch_candidate_markets(exclude_ids: set) -> list:
+    from collections import Counter
     raw_markets, offset, page_size = [], 0, 500
+    terminated_naturally = False
+    hit_safety_cap = False
+    
     while True:
         try:
             resp = pmus_client().markets.list({"limit": page_size, "closed": False, "offset": offset})
@@ -224,17 +228,31 @@ def fetch_candidate_markets(exclude_ids: set) -> list:
             break
         batch = resp.get("markets") or []
         raw_markets.extend(batch)
+        
+        log.info(f"[DEBUG] Fetching pagination loop: offset={offset}, fetched_batch_size={len(batch)}, running_total={len(raw_markets)}")
+        
         if len(batch) < page_size:
+            terminated_naturally = True
+            log.info(f"[DEBUG] Pagination terminating naturally: batch size {len(batch)} is less than page size {page_size} at offset {offset}.")
             break
         offset += page_size
         if offset > 10000:      # safety cap; the full open-market universe is ~5.5k
-            log.warning("markets.list pagination hit safety cap at offset 10000.")
+            hit_safety_cap = True
+            log.warning(f"[DEBUG] Pagination hit safety cap at offset {offset} (limit 10000).")
             break
 
+    log.info(f"[DEBUG] Pagination completed. terminated_naturally={terminated_naturally}, hit_safety_cap={hit_safety_cap}")
+    log.info(f"[DEBUG] Total open-market count fetched: {len(raw_markets)}")
+    
+    # Print a Counter of the category field across all fetched markets before the MARKET_TAGS filter is applied
+    category_counts = Counter(m.get("category") for m in raw_markets)
+    log.info(f"[DEBUG] Category field Counter across all fetched markets before filter: {dict(category_counts)}")
+    
+    # Confirming filter condition targets category field and not tags field
+    log.info("[DEBUG] Filtering candidates by checking m.get('category') in MARKET_TAGS. Note that m.get('tags') is not used here.")
     candidates = [m for m in raw_markets if m.get("category") in MARKET_TAGS]
-    candidates.sort(key=lambda m: float(m.get("volume24hr") or 0), reverse=True)
-
-    snapshots = []
+    log.info(f"[DEBUG] Filtered from {len(raw_markets)} to {len(candidates)} candidates matching category in {MARKET_TAGS}")
+    cheap_candidates = []
     for m in candidates:
         try:
             if m.get("closed") or not m.get("active", True):
@@ -243,33 +261,83 @@ def fetch_candidate_markets(exclude_ids: set) -> list:
             if not mid or mid in exclude_ids:
                 continue
 
-            # FLAGGED TO OPERATOR (not a RISK change): Polymarket US market
-            # objects expose no liquidity figure of any kind. volume24hr is the
-            # closest available substitute; min_liquidity_usd is unchanged but
-            # now effectively gates on 24h volume, not book depth. If a truer
-            # depth-based figure is wanted, markets.book(slug) returns real
-            # bids/offers with quantities that could be summed into a notional
-            # figure at the cost of one extra call per surviving candidate.
-            liquidity_proxy = float(m.get("volume24hr") or 0)
-            if liquidity_proxy < RISK["min_liquidity_usd"]:
+            # Extract pricing from list() object fields bestBidQuote and bestAskQuote
+            bid_quote = m.get("bestBidQuote")
+            ask_quote = m.get("bestAskQuote")
+            if not bid_quote or not ask_quote:
+                continue
+            try:
+                bid_price = float(bid_quote.get("value") or 0)
+                ask_price = float(ask_quote.get("value") or 0)
+            except (TypeError, ValueError):
                 continue
 
-            book = fetch_top_of_book(mid)
-            if book is None:
+            # Exclude prices outside ~0.03–0.97
+            if bid_price < 0.03 or bid_price > 0.97 or ask_price < 0.03 or ask_price > 0.97:
                 continue
+
+            cheap_candidates.append((m, bid_price, ask_price))
+        except Exception as e:
+            log.debug(f"skip candidate in cheap pass: {e}")
+
+    # Sort candidates by soonest endDate/gameStartTime
+    def get_soonest_time(item):
+        m = item[0]
+        t1 = m.get("gameStartTime")
+        t2 = m.get("endDate")
+        times = [t for t in (t1, t2) if t]
+        return min(times) if times else "9999-12-31T23:59:59Z"
+
+    cheap_candidates.sort(key=get_soonest_time)
+    
+    # Shortlist top 100
+    shortlist = cheap_candidates[:100]
+    
+    snapshots = []
+    book_checked = 0
+    book_cleared = 0
+
+    for m, bid_price, ask_price in shortlist:
+        mid = m.get("slug")
+        try:
+            book_checked += 1
+            book_resp = pmus_client().markets.book(mid)
+            market_data = book_resp.get("marketData") or {}
+            bids = market_data.get("bids") or []
+            offers = market_data.get("offers") or []
+            if not bids or not offers:
+                continue
+
+            # Compute liquidity from top book level
+            top_bid = bids[0]
+            top_offer = offers[0]
+
+            top_bid_px = float(top_bid["px"]["value"])
+            top_bid_qty = float(top_bid["qty"])
+            top_ask_px = float(top_offer["px"]["value"])
+            top_ask_qty = float(top_offer["qty"])
+
+            liquidity_usd = (top_bid_px * top_bid_qty) + (top_ask_px * top_ask_qty)
+
+            if liquidity_usd < RISK["min_liquidity_usd"]:
+                continue
+
+            book_cleared += 1
 
             snapshots.append(MarketSnapshot(
                 market_id=mid, question=m.get("question", ""),
                 description=(m.get("description") or "")[:1200],
                 end_date=m.get("endDate", ""),
                 yes_token_id=mid, no_token_id=mid,
-                best_bid=book["bid"], best_ask=book["ask"],
-                liquidity_usd=liquidity_proxy, volume_24h=liquidity_proxy,
+                best_bid=bid_price, best_ask=ask_price,
+                liquidity_usd=liquidity_usd, volume_24h=liquidity_usd,
             ))
         except Exception as e:
             log.debug(f"skip market: {e}")
         if len(snapshots) >= MAX_MARKETS_PER_RUN:
             break
+
+    log.info(f"Book liquidity check: checked {book_checked} candidates via book(), {book_cleared} cleared the min_liquidity_usd threshold of {RISK['min_liquidity_usd']}.")
     log.info(f"{len(snapshots)} candidates [{', '.join(MARKET_TAGS)}]")
     return snapshots
 
