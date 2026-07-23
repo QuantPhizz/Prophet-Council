@@ -324,8 +324,20 @@ def fetch_candidate_markets(exclude_ids: set) -> list:
 
             book_cleared += 1
 
+            title = m.get("title")
+            if not title:
+                for side in m.get("marketSides", []):
+                    team_name = side.get("team", {}).get("name")
+                    if team_name:
+                        title = team_name
+                        break
+
+            question = m.get("question", "")
+            if title and title not in question:
+                question = f"{question} ({title})"
+
             snapshots.append(MarketSnapshot(
-                market_id=mid, question=m.get("question", ""),
+                market_id=mid, question=question,
                 description=(m.get("description") or "")[:1200],
                 end_date=m.get("endDate", ""),
                 yes_token_id=mid, no_token_id=mid,
