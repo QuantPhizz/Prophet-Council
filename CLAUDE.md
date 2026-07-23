@@ -35,7 +35,10 @@ Persona files live in `personas/` and must sit alongside `orchestrator.py`
 - 2-of-3 unweighted vote required for entries and exits; Kisuke's 1.3 weight
   moves consensus numbers (probability, edge, sizing, fair value), never votes.
 - Consolidated calls: one batched API call per agent per run.
-- Cron cadence: 6 runs/day UTC (0,4,8,12,16,20); hunts only on 0/8/16.
+- Cron cadence: 6 full desk runs/day UTC (0,4,8,12,16,20); hunts only on 0/8/16.
+  Separately, `watchdog_dynamic.sh` fires every 2 min but only actually runs
+  `orchestrator.py --watchdog-only` every 2 min while a position is open —
+  idle, it throttles itself back to the :00/:20/:40 tick (~20 min).
 - RISK parameters, agent weights, and personas are LOCKED — owner changes only.
 
 ## SECRETS & SAFETY

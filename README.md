@@ -60,9 +60,17 @@ Cron (installed):
 # full desk run, 6x daily UTC; hunts fire automatically on the 0/8/16 runs
 0 0,4,8,12,16,20 * * * cd "$HOME/tko-agents/Prophet Council" && set -a && . ./.env && set +a && "$HOME/tko-agents/Prophet Council/.venv/bin/python" orchestrator.py >> orchestrator.log 2>&1
 
-# watchdog-only, every 20 min — mechanical exits between full desk runs
-*/20 * * * * cd "$HOME/tko-agents/Prophet Council" && set -a && . ./.env && set +a && "$HOME/tko-agents/Prophet Council/.venv/bin/python" orchestrator.py --watchdog-only >> orchestrator_watchdog.log 2>&1
+# watchdog, dynamic cadence — see watchdog_dynamic.sh
+*/2 * * * * "$HOME/tko-agents/Prophet Council/watchdog_dynamic.sh"
 ```
+
+The watchdog line fires every 2 minutes unconditionally, but `watchdog_dynamic.sh`
+only actually invokes `orchestrator.py --watchdog-only` when it's worth it:
+- **Positions open:** runs every tick — i.e. every 2 min, tight monitoring of
+  hard stops / trailing take-profit / settlement while there's real exposure.
+- **Idle (no positions):** only runs on the `:00`/`:20`/`:40` tick, i.e. falls
+  back to the original ~20 min cadence rather than hitting the API every 2
+  min for nothing to watch.
 
 State (bankroll, positions, journal) persists in `orchestrator_state.json`
 (gitignored). Logs go to `orchestrator.log` / `orchestrator_watchdog.log` (gitignored).
@@ -73,9 +81,12 @@ State (bankroll, positions, journal) persists in `orchestrator_state.json`
   `volume24hr` as a substitute; `RISK.min_liquidity_usd` now effectively gates
   on 24h volume, not book depth. Flagged, not silently redefined — see
   comments in `fetch_candidate_markets`.
-- **Credential auth currently fails on authenticated endpoints** (`account.balances`,
-  `portfolio.positions`, `orders.*`) with a base64 padding error — the stored
-  `POLYMARKET_SECRET_KEY` looks truncated (86 chars, not a multiple of 4).
-  Public endpoints (`markets.list`/`bbo`/`book`/`retrieve_by_slug`) are
-  unaffected and work today. This only blocks `LIVE_TRADING=true`, which is
-  out of scope regardless — paper mode is fully functional.
+
+**Resolved (2026-07-12):** `POLYMARKET_SECRET_KEY` was truncated (86 chars,
+not a multiple of 4 — invalid base64 padding), causing every authenticated
+endpoint to fail. Operator replaced it with the full value; re-verified
+end-to-end: `account.balances` / `portfolio.positions` now return `200 OK`
+(account is unfunded — empty balances/positions, as expected), and
+`orders.preview` round-trips against a real live market. Auth is confirmed
+working. Account still has $0 funded, and `LIVE_TRADING` stays `false` until
+the operator funds it and says otherwise.
